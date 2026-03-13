@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { collection, onSnapshot, doc, updateDoc, addDoc, deleteDoc } from "firebase/firestore";
 import { db } from "../firebase/firebaseConfig";
 import {
@@ -30,7 +30,82 @@ const navItems = [
   { icon: <Users size={18}/>,       label: "customers" },
 ];
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+// ─── UNIFIED HELPERS ──────────────────────────────────────────────────────────
+function getOrderTimestamp(order) {
+  try {
+    let timestamp = order.orderDate || order.createdAt;
+    if (!timestamp) return 0;
+    if (timestamp.toMillis && typeof timestamp.toMillis === 'function') {
+      return timestamp.toMillis();
+    }
+    if (timestamp instanceof Date) {
+      return timestamp.getTime();
+    }
+    return 0;
+  } catch (error) {
+    console.error("Error getting timestamp:", error);
+    return 0;
+  }
+}
+
+function getOrderAmount(order) {
+  try {
+    if (!order) return 0;
+    if (order.totalAmount !== undefined && order.totalAmount !== null) {
+      const parsed = parseFloat(order.totalAmount);
+      if (!isNaN(parsed)) return parsed;
+    }
+    if (order.pricing && typeof order.pricing === 'object') {
+      if (order.pricing.totalAmount !== undefined && order.pricing.totalAmount !== null) {
+        const parsed = parseFloat(order.pricing.totalAmount);
+        if (!isNaN(parsed)) return parsed;
+      }
+    }
+    if (typeof order.pricing === 'number' && !isNaN(order.pricing)) {
+      return order.pricing;
+    }
+    return 0;
+  } catch (error) {
+    console.error("Error getting amount:", error);
+    return 0;
+  }
+}
+
+function formatOrderDate(order) {
+  try {
+    if (!order) return "-";
+    let timestamp = order.orderDate || order.createdAt;
+    if (!timestamp) return "-";
+    if (timestamp.toDate && typeof timestamp.toDate === 'function') {
+      return timestamp.toDate().toLocaleDateString("en-IN");
+    }
+    if (timestamp instanceof Date) {
+      return timestamp.toLocaleDateString("en-IN");
+    }
+    return "-";
+  } catch (error) {
+    console.error("Error formatting date:", error);
+    return "-";
+  }
+}
+
+// ✅ NEW: Safe helper to format a Firestore Timestamp or Date to locale date string
+function formatTimestamp(timestamp) {
+  try {
+    if (!timestamp) return "-";
+    if (timestamp.toDate && typeof timestamp.toDate === 'function') {
+      return timestamp.toDate().toLocaleDateString("en-IN");
+    }
+    if (timestamp instanceof Date) {
+      return timestamp.toLocaleDateString("en-IN");
+    }
+    return "-";
+  } catch (error) {
+    console.error("Error formatting timestamp:", error);
+    return "-";
+  }
+}
+
 function StatusBadge({ status }) {
   const cfg = STATUS_CONFIG[status] || { bg: "#f5f5f5", color: "#888", dot: "#ccc" };
   return (
@@ -97,7 +172,7 @@ function OrderModal({ order, onClose, onStatusChange }) {
             <div style={{ fontSize:12, color:"#aaa", marginTop:2 }}>{order.userEmail}</div>
           </div>
           <div style={{ marginLeft:"auto", fontSize:12, color:"#aaa" }}>
-            {order.createdAt?.toDate?.().toLocaleDateString("en-IN") ?? "-"}
+            {formatOrderDate(order)}
           </div>
         </div>
 
@@ -117,7 +192,7 @@ function OrderModal({ order, onClose, onStatusChange }) {
           padding:"12px 16px", background:"#f9f9f9", borderRadius:12, marginBottom:22 }}>
           <span style={{ fontSize:13, color:"#888", fontWeight:600 }}>Order Total</span>
           <span style={{ fontFamily:"'Playfair Display',serif", fontSize:22, fontWeight:700, color:"#FF6B35" }}>
-            ₹{order.totalAmount}
+            ₹{Number(getOrderAmount(order)).toFixed(2)}
           </span>
         </div>
 
@@ -141,8 +216,13 @@ function OrderModal({ order, onClose, onStatusChange }) {
   );
 }
 
-function CustomerModal({ customer, onClose, gradient }) {
+function CustomerModal({ customer, onClose, gradient, usersDataRef }) {
   if (!customer) return null;
+
+  // ✅ FIX: Read createdAt directly from usersDataRef at render time — never stale
+  // Use createdAt directly from customer object (populated from users collection)
+  const registeredDate = formatTimestamp(customer.createdAt || customer.registeredAt || null);
+
   return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.4)",
       backdropFilter:"blur(4px)", zIndex:1000, display:"flex", alignItems:"center",
@@ -151,7 +231,7 @@ function CustomerModal({ customer, onClose, gradient }) {
         width:"100%", maxWidth:460, maxHeight:"90vh", overflowY:"auto",
         boxShadow:"0 24px 80px rgba(0,0,0,0.18)", animation:"slideUp 0.25s ease" }}>
 
-        {/* Banner with avatar + name inside */}
+        {/* Banner */}
         <div style={{ background:"linear-gradient(135deg,#2C1A0E,#4a2c14)",
           padding:"24px 28px 28px", borderRadius:"24px 24px 0 0", position:"relative" }}>
           <div onClick={onClose} style={{ position:"absolute", top:14, right:14, width:32, height:32,
@@ -187,7 +267,8 @@ function CustomerModal({ customer, onClose, gradient }) {
         <div style={{ padding:"20px 28px 28px", display:"flex", flexDirection:"column", gap:10 }}>
           {[
             { icon:"🆔", label:"User ID",    value: customer.userId?.slice(0,24)+"..." },
-            { icon:"📅", label:"Registered", value: customer.createdAt?.toDate?.().toLocaleString("en-IN") ?? "-" },
+            // ✅ FIX: Reads live from usersDataRef — no stale/null date
+            { icon:"📅", label:"Registered", value: registeredDate },
           ].map(({ icon, label, value }) => (
             <div key={label} style={{ display:"flex", alignItems:"center", gap:12,
               padding:"13px 16px", background:"#fafafa", borderRadius:12 }}>
@@ -220,19 +301,104 @@ export default function AdminDashboard({ onLogout }) {
   const [search, setSearch]               = useState("");
   const [activePill, setActivePill]       = useState("Week");
   const [stats, setStats]                 = useState({ newOrders:0, pendingOrders:0, totalSales:0, menuItems:0 });
+  const [notifications, setNotifications] = useState([]);
+  const [showNotifs, setShowNotifs]       = useState(false);
+  const seenOrderIds = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem("seenOrderIds") || "[]")); }
+    catch { return new Set(); }
+  })[0];
+  const seenRef = useRef(seenOrderIds);
 
-  // ── Firebase: listen to orders + products ────────────────────────────────
+  // ✅ FIX: Use a ref to store usersData so it's always up-to-date when orders listener fires
+  const usersDataRef = useRef({});
+
+  // ── Close notification panel on outside click ────────────────────────────
   useEffect(() => {
+    if (!showNotifs) return;
+    const handler = (e) => {
+      if (!e.target.closest("#notif-panel")) setShowNotifs(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showNotifs]);
+
+  // ── Firebase: listen to orders + products + users ────────────────────────────────
+  useEffect(() => {
+    let firstLoad = true;
+
+    // ✅ FIX: Users listener — index by doc ID AND email for reliable lookup
+    const unsubUsers = onSnapshot(collection(db, "users"), (snap) => {
+      const byId    = {};
+      const byEmail = {};
+      snap.docs.forEach(d => {
+        const data = d.data();
+        byId[d.id] = data;
+        if (data.email) byEmail[data.email.toLowerCase()] = data;
+      });
+      usersDataRef.current = { byId, byEmail };
+
+      // Patch already-loaded customers using ID first, email as fallback
+      setCustomers(prev => prev.map(c => {
+        const userData =
+          byId[c.userId] ||
+          byEmail[c.email?.toLowerCase()] ||
+          null;
+        return {
+          ...c,
+          createdAt: userData?.createdAt || c.createdAt || null,
+          registeredAt: userData?.createdAt || c.registeredAt || null,
+        };
+      }));
+    });
+
     const unsubOrders = onSnapshot(collection(db, "orders"), (snap) => {
       const data = snap.docs.map(d => ({ id:d.id, ...d.data() }))
-        .sort((a,b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+        .sort((a,b) => getOrderTimestamp(b) - getOrderTimestamp(a));
       setOrders(data);
 
+      // ── Detect new orders ──
+      if (firstLoad) {
+        firstLoad = false;
+        data.forEach(o => seenRef.current.add(o.id));
+        try { localStorage.setItem("seenOrderIds", JSON.stringify([...seenRef.current])); } catch {}
+      } else {
+        const newNotifs = [];
+        data.forEach(o => {
+          if (!seenRef.current.has(o.id)) {
+            seenRef.current.add(o.id);
+            newNotifs.push({
+              id: o.id,
+              message: `New order from ${o.userName || "a customer"}`,
+              amount: getOrderAmount(o),
+              time: o.createdAt?.toDate?.() ?? new Date(),
+              read: false,
+            });
+          }
+        });
+        if (newNotifs.length > 0) {
+          setNotifications(n => [...newNotifs, ...n].slice(0, 20));
+          try { localStorage.setItem("seenOrderIds", JSON.stringify([...seenRef.current])); } catch {}
+        }
+      }
+
+      // Build customers — use earliest order date as join date (users collection permission denied)
       const unique = {};
+      // First pass: collect all orders per user to find the earliest
       data.forEach(o => {
-        if (!unique[o.userId]) unique[o.userId] = {
-          userId: o.userId, name: o.userName, email: o.userEmail, createdAt: o.createdAt
-        };
+        const ts = getOrderTimestamp(o);
+        if (!unique[o.userId]) {
+          unique[o.userId] = {
+            userId: o.userId,
+            name: o.userName,
+            email: o.userEmail,
+            createdAt: o.orderDate || o.createdAt || null,
+            earliestTs: ts,
+          };
+        } else if (ts < unique[o.userId].earliestTs) {
+          // Keep the earliest order's timestamp as the join date
+          unique[o.userId].createdAt = o.orderDate || o.createdAt || null;
+          unique[o.userId].earliestTs = ts;
+        }
       });
       setCustomers(Object.values(unique));
 
@@ -240,7 +406,7 @@ export default function AdminDashboard({ onLogout }) {
         ...prev,
         newOrders: data.length,
         pendingOrders: data.filter(o => ["pending","placed","preparing"].includes(o.status?.toLowerCase())).length,
-        totalSales: Number(data.reduce((s,o) => s + (o.totalAmount||0), 0).toFixed(2)),
+        totalSales: Number(data.reduce((s,o) => s + getOrderAmount(o), 0).toFixed(2)),
       }));
     });
 
@@ -250,7 +416,7 @@ export default function AdminDashboard({ onLogout }) {
       setStats(prev => ({ ...prev, menuItems: data.length }));
     });
 
-    return () => { unsubOrders(); unsubProducts(); };
+    return () => { unsubUsers(); unsubOrders(); unsubProducts(); };
   }, []);
 
   // ── Firebase: actions ────────────────────────────────────────────────────
@@ -279,27 +445,21 @@ export default function AdminDashboard({ onLogout }) {
 
   const donutData = Object.entries(statusCounts).map(([name,value]) => ({ name, value }));
 
-  // Build revenue chart data based on activePill (Week / Month)
   const revenueData = (() => {
     const now = new Date();
-
     if (activePill === "Week") {
-      // Show Mon, Tue, Wed, Thu, Fri, Sat, Sun — fixed order
       const allDays = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
       const map = {};
       orders.forEach(o => {
         if (!o.createdAt?.toDate) return;
         const d = o.createdAt.toDate();
-        // getDay(): 0=Sun,1=Mon,...,6=Sat → map to Mon-Sun labels
-        const dayIndex = (d.getDay() + 6) % 7; // shift so Mon=0
+        const dayIndex = (d.getDay() + 6) % 7;
         const key = allDays[dayIndex];
-        map[key] = (map[key] || 0) + (o.totalAmount || 0);
+        map[key] = (map[key] || 0) + getOrderAmount(o);
       });
       return allDays.map(d => ({ day: d, revenue: Math.round(map[d] || 0) }));
     }
-
     if (activePill === "Month") {
-      // Show Jan, Feb, Mar, ... Dec — all 12 months of current year
       const allMonths = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
       const year = now.getFullYear();
       const map = {};
@@ -308,12 +468,11 @@ export default function AdminDashboard({ onLogout }) {
         const d = o.createdAt.toDate();
         if (d.getFullYear() === year) {
           const key = allMonths[d.getMonth()];
-          map[key] = (map[key] || 0) + (o.totalAmount || 0);
+          map[key] = (map[key] || 0) + getOrderAmount(o);
         }
       });
       return allMonths.map(m => ({ day: m, revenue: Math.round(map[m] || 0) }));
     }
-
     return [];
   })();
 
@@ -405,12 +564,96 @@ export default function AdminDashboard({ onLogout }) {
                       fontSize:14, color:"#333", width:"100%" }}/>
                 </div>
               )}
-              <div style={{ width:42, height:42, borderRadius:"50%", background:"white",
-                display:"flex", alignItems:"center", justifyContent:"center",
-                fontSize:18, boxShadow:"0 2px 12px rgba(0,0,0,0.08)", cursor:"pointer", position:"relative" }}>
-                <Bell size={18} color="#6d4c41"/>
-                <div style={{ width:10, height:10, background:"#FF8B94", borderRadius:"50%",
-                  position:"absolute", top:6, right:6, border:"2px solid white" }}/>
+              {/* ── Notification Bell ── */}
+              <div id="notif-panel" style={{ position:"relative" }}>
+                <div onClick={() => { setShowNotifs(v => !v); }}
+                  style={{ width:42, height:42, borderRadius:"50%", background:"white",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    fontSize:18, boxShadow:"0 2px 12px rgba(0,0,0,0.08)", cursor:"pointer", position:"relative" }}>
+                  <Bell size={18} color="#6d4c41"/>
+                  {notifications.filter(n=>!n.read).length > 0 && (
+                    <div style={{ position:"absolute", top:5, right:5,
+                      minWidth:16, height:16, background:"#FF6B35", borderRadius:20,
+                      border:"2px solid white", display:"flex", alignItems:"center",
+                      justifyContent:"center", fontSize:9, fontWeight:800, color:"white",
+                      padding:"0 3px" }}>
+                      {notifications.filter(n=>!n.read).length}
+                    </div>
+                  )}
+                </div>
+
+                {showNotifs && (
+                  <div style={{ position:"absolute", top:52, right:0, width:340,
+                    background:"white", borderRadius:20, boxShadow:"0 8px 40px rgba(0,0,0,0.15)",
+                    zIndex:999, overflow:"hidden", animation:"slideUp 0.2s ease" }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                      padding:"16px 20px", borderBottom:"1px solid #f5f5f5" }}>
+                      <div style={{ fontFamily:"'Playfair Display',serif", fontSize:16, fontWeight:700 }}>
+                        Notifications
+                      </div>
+                      {notifications.some(n=>!n.read) && (
+                        <div onClick={() => setNotifications(n => n.map(x=>({...x,read:true})))}
+                          style={{ fontSize:12, color:"#FF6B35", fontWeight:600, cursor:"pointer" }}>
+                          Mark all read
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ maxHeight:320, overflowY:"auto" }}>
+                      {notifications.length === 0 ? (
+                        <div style={{ padding:"40px 20px", textAlign:"center", color:"#bbb", fontSize:14 }}>
+                          🔔 No notifications yet
+                        </div>
+                      ) : notifications.map((n, i) => (
+                        <div key={n.id} onClick={() => {
+                            setNotifications(prev => prev.map((x,j) => j===i ? {...x,read:true} : x));
+                            setShowNotifs(false);
+                            setView("orders");
+                          }}
+                          style={{ display:"flex", alignItems:"flex-start", gap:12,
+                            padding:"14px 20px", cursor:"pointer", transition:"background 0.15s",
+                            background: n.read ? "white" : "#FFF8F0",
+                            borderBottom:"1px solid #f9f9f9" }}>
+                          <div style={{ width:38, height:38, borderRadius:12, flexShrink:0,
+                            background: n.read ? "#f5f5f5" : "#FFF0EA",
+                            display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 }}>
+                            🛒
+                          </div>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ fontSize:13, fontWeight: n.read ? 500 : 700,
+                              color: n.read ? "#888" : "#1a1a1a", lineHeight:1.4 }}>
+                              {n.message}
+                            </div>
+                            <div style={{ fontSize:12, color:"#FF6B35", fontWeight:600, marginTop:2 }}>
+                              ₹{Number(n.amount).toFixed(2)}
+                            </div>
+                            <div style={{ fontSize:11, color:"#bbb", marginTop:2 }}>
+                              {n.time?.toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit" })}
+                              {" · "}
+                              {n.time?.toLocaleDateString("en-IN")}
+                            </div>
+                          </div>
+                          {!n.read && (
+                            <div style={{ width:8, height:8, borderRadius:"50%",
+                              background:"#FF6B35", flexShrink:0, marginTop:4 }}/>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    {notifications.length > 0 && (
+                      <div style={{ padding:"12px 20px", borderTop:"1px solid #f5f5f5",
+                        display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                        <div onClick={() => { setShowNotifs(false); setView("orders"); }}
+                          style={{ fontSize:12, color:"#FF6B35", fontWeight:600, cursor:"pointer" }}>
+                          View all orders →
+                        </div>
+                        <div onClick={() => setNotifications([])}
+                          style={{ fontSize:12, color:"#bbb", cursor:"pointer" }}>
+                          Clear all
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               <div style={{ width:42, height:42, borderRadius:"50%",
                 background:"linear-gradient(135deg,#FF6B35,#ff9a56)",
@@ -422,7 +665,6 @@ export default function AdminDashboard({ onLogout }) {
           {/* ════════════════ DASHBOARD VIEW ════════════════ */}
           {view==="dashboard" && (
             <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-              {/* Stat Cards */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:18 }}>
                 {[
                   { icon:"🛒", label:"New Orders",   value:stats.newOrders,    change:"↑ live",       up:true,  color:"orange" },
@@ -456,7 +698,6 @@ export default function AdminDashboard({ onLogout }) {
                 })}
               </div>
 
-              {/* Goal Banner */}
               <div style={{ background:"linear-gradient(135deg,#FF6B35,#ff9a56)", borderRadius:18,
                 padding:"20px 28px", color:"white", display:"flex", alignItems:"center",
                 gap:20, animation:"slideUp 0.5s ease 0.25s both" }}>
@@ -479,9 +720,7 @@ export default function AdminDashboard({ onLogout }) {
                 <div style={{ fontSize:13, opacity:0.75, whiteSpace:"nowrap" }}>Target: ₹5,000</div>
               </div>
 
-              {/* Charts Row */}
               <div style={{ display:"grid", gridTemplateColumns:"1.6fr 1fr", gap:18 }}>
-                {/* Revenue Bar Chart */}
                 <div style={{ background:"white", borderRadius:20, padding:28,
                   boxShadow:"0 2px 16px rgba(0,0,0,0.05)", animation:"slideUp 0.5s ease 0.3s both" }}>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:22 }}>
@@ -514,7 +753,6 @@ export default function AdminDashboard({ onLogout }) {
                   </ResponsiveContainer>
                 </div>
 
-                {/* Donut Chart */}
                 <div style={{ background:"white", borderRadius:20, padding:28,
                   boxShadow:"0 2px 16px rgba(0,0,0,0.05)", animation:"slideUp 0.5s ease 0.35s both" }}>
                   <div style={{ fontFamily:"'Playfair Display',serif", fontSize:18, fontWeight:700, marginBottom:10 }}>
@@ -534,7 +772,6 @@ export default function AdminDashboard({ onLogout }) {
                 </div>
               </div>
 
-              {/* Recent Orders mini-table */}
               <div style={{ background:"white", borderRadius:20, padding:28,
                 boxShadow:"0 2px 16px rgba(0,0,0,0.05)", animation:"slideUp 0.5s ease 0.4s both" }}>
                 <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
@@ -556,7 +793,7 @@ export default function AdminDashboard({ onLogout }) {
                       </div>
                     </div>
                     <StatusBadge status={o.status}/>
-                    <div style={{ fontSize:14, fontWeight:700 }}>₹{o.totalAmount}</div>
+                    <div style={{ fontSize:14, fontWeight:700 }}>₹{Number(getOrderAmount(o)).toFixed(2)}</div>
                   </div>
                 ))}
               </div>
@@ -566,7 +803,6 @@ export default function AdminDashboard({ onLogout }) {
           {/* ════════════════ ORDERS VIEW ════════════════ */}
           {view==="orders" && (
             <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-              {/* Stat Strip */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:14 }}>
                 {[
                   { label:"Total Orders", value:orders.length,             icon:"🛒", primary:true },
@@ -590,7 +826,6 @@ export default function AdminDashboard({ onLogout }) {
                 ))}
               </div>
 
-              {/* Filter Pills */}
               <div style={{ background:"white", borderRadius:18, padding:"16px 24px",
                 boxShadow:"0 2px 14px rgba(0,0,0,0.05)", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
                 <span style={{ fontSize:12, fontWeight:700, color:"#aaa", textTransform:"uppercase",
@@ -616,10 +851,8 @@ export default function AdminDashboard({ onLogout }) {
                 })}
               </div>
 
-              {/* Orders Table */}
               <div style={{ background:"white", borderRadius:20, overflow:"hidden",
                 boxShadow:"0 2px 16px rgba(0,0,0,0.05)" }}>
-                {/* Sticky Header */}
                 <div style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1.2fr 0.8fr 0.8fr 0.7fr",
                   padding:"14px 28px", background:"#fafafa", borderBottom:"1px solid #f0f0f0",
                   position:"sticky", top:0, zIndex:2 }}>
@@ -628,7 +861,6 @@ export default function AdminDashboard({ onLogout }) {
                       textTransform:"uppercase", letterSpacing:0.8 }}>{h}</div>
                   ))}
                 </div>
-                {/* Scrollable Body - no height cap, page itself scrolls */}
                 <div>
                 {filteredOrders.length===0
                   ? <div style={{ padding:"60px 28px", textAlign:"center", color:"#bbb", fontSize:15 }}>😔 No orders found</div>
@@ -644,10 +876,8 @@ export default function AdminDashboard({ onLogout }) {
                         <span style={{ fontSize:13, color:"#333", fontWeight:500 }}>{order.userName}</span>
                       </div>
                       <StatusBadge status={order.status}/>
-                      <div style={{ fontFamily:"'Playfair Display',serif", fontSize:16, fontWeight:700 }}>₹{order.totalAmount}</div>
-                      <div style={{ fontSize:12, color:"#aaa" }}>
-                        {order.createdAt?.toDate?.().toLocaleDateString("en-IN") ?? "-"}
-                      </div>
+                      <div style={{ fontFamily:"'Playfair Display',serif", fontSize:16, fontWeight:700 }}>₹{Number(getOrderAmount(order)).toFixed(2)}</div>
+                      <div style={{ fontSize:12, color:"#aaa" }}>{formatOrderDate(order)}</div>
                       <button className="btn-hover" onClick={()=>setSelectedOrder(order)} style={{
                         padding:"7px 16px", borderRadius:10, border:"1.5px solid #e8e8e8",
                         background:"white", color:"#555", fontSize:12, fontWeight:700, cursor:"pointer",
@@ -655,10 +885,9 @@ export default function AdminDashboard({ onLogout }) {
                     </div>
                   ))
                 }
-                </div>{/* end scrollable body */}
+                </div>
               </div>
 
-              {/* Footer */}
               <div style={{ background:"linear-gradient(135deg,#2C1A0E,#4a2c14)", borderRadius:16,
                 padding:"14px 28px", display:"flex", gap:24, alignItems:"center" }}>
                 <span style={{ fontSize:14, color:"rgba(255,255,255,0.6)" }}>
@@ -683,16 +912,15 @@ export default function AdminDashboard({ onLogout }) {
           {/* ════════════════ PRODUCTS VIEW ════════════════ */}
           {view==="products" && (
             <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-              {/* Add Product Form */}
               <div style={{ background:"white", borderRadius:20, padding:28,
                 boxShadow:"0 2px 16px rgba(0,0,0,0.05)", animation:"slideUp 0.4s ease both" }}>
                 <div style={{ fontFamily:"'Playfair Display',serif", fontSize:20, fontWeight:700,
                   color:"#1a1a1a", marginBottom:20 }}>🧁 Add New Menu Item</div>
                 <form onSubmit={handleAddProduct} style={{ display:"flex", flexWrap:"wrap", gap:14, alignItems:"flex-end" }}>
                   {[
-                    { key:"name",     ph:"Item Name",    type:"text"   },
-                    { key:"price",    ph:"Price (₹)",    type:"number" },
-                    { key:"image",    ph:"Image URL",    type:"text"   },
+                    { key:"name",  ph:"Item Name", type:"text"   },
+                    { key:"price", ph:"Price (₹)", type:"number" },
+                    { key:"image", ph:"Image URL", type:"text"   },
                   ].map(({ key,ph,type }) => (
                     <input key={key} type={type} placeholder={ph} required value={newProduct[key]}
                       onChange={e=>setNewProduct({...newProduct,[key]:e.target.value})}
@@ -717,7 +945,6 @@ export default function AdminDashboard({ onLogout }) {
                 </form>
               </div>
 
-              {/* Products Table */}
               <div style={{ background:"white", borderRadius:20, overflow:"hidden",
                 boxShadow:"0 2px 16px rgba(0,0,0,0.05)" }}>
                 <div style={{ padding:"18px 28px", background:"#fafafa", borderBottom:"1px solid #f0f0f0",
@@ -756,12 +983,11 @@ export default function AdminDashboard({ onLogout }) {
           {/* ════════════════ CUSTOMERS VIEW ════════════════ */}
           {view==="customers" && (
             <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-              {/* Summary Cards */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:14 }}>
                 {[
-                  { label:"Total Customers", value:customers.length, icon:"👥", primary:true },
-                  { label:"Total Revenue",   value:`₹${stats.totalSales}`, icon:"💰", accent:"#FFFBE6" },
-                  { label:"Total Orders",    value:orders.length, icon:"🛒", accent:"#E8FAF9" },
+                  { label:"Total Customers", value:customers.length,        icon:"👥", primary:true },
+                  { label:"Total Revenue",   value:`₹${stats.totalSales}`,  icon:"💰", accent:"#FFFBE6" },
+                  { label:"Total Orders",    value:orders.length,           icon:"🛒", accent:"#E8FAF9" },
                 ].map((s,i) => (
                   <div key={i} style={{ background: s.primary?"linear-gradient(135deg,#FF6B35,#ff9a56)":"white",
                     borderRadius:18, padding:"18px 22px", display:"flex", alignItems:"center", gap:14,
@@ -779,7 +1005,6 @@ export default function AdminDashboard({ onLogout }) {
                 ))}
               </div>
 
-              {/* Customers Grid */}
               <div style={{ display:"grid", gridTemplateColumns:"repeat(2,1fr)", gap:18 }}>
                 {customers
                   .filter(c => c.name?.toLowerCase().includes(search.toLowerCase()) ||
@@ -787,7 +1012,7 @@ export default function AdminDashboard({ onLogout }) {
                   .map((c,i) => {
                     const gradient = AVATAR_GRADIENTS[i%4];
                     const custOrders = orders.filter(o => o.userId===c.userId);
-                    const spent = custOrders.reduce((s,o) => s+(o.totalAmount||0), 0);
+                    const spent = custOrders.reduce((s,o) => s + getOrderAmount(o), 0);
                     const spendPct = Math.round((spent / (stats.totalSales||1)) * 100);
                     return (
                       <div key={c.userId} className="card-hover" onClick={()=>setSelectedCustomer(c)}
@@ -808,7 +1033,8 @@ export default function AdminDashboard({ onLogout }) {
                           {[
                             { label:"Orders", value:custOrders.length, icon:"🛒" },
                             { label:"Spent",  value:`₹${spent.toFixed(0)}`, icon:"💰" },
-                            { label:"Last",   value:custOrders[0]?.createdAt?.toDate?.().toLocaleDateString("en-IN","short")??"-", icon:"📅" },
+                            { label:"Last",   value: formatOrderDate(custOrders[0]) !== "-"
+                                ? formatOrderDate(custOrders[0]) : "-", icon:"📅" },
                           ].map(({ label,value,icon }) => (
                             <div key={label} style={{ background:"#fafafa", borderRadius:12,
                               padding:"10px 12px", textAlign:"center" }}>
@@ -834,7 +1060,7 @@ export default function AdminDashboard({ onLogout }) {
                         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
                           marginTop:14, paddingTop:12, borderTop:"1px solid #f5f5f5" }}>
                           <div style={{ fontSize:11, color:"#bbb" }}>
-                            📅 Joined {c.createdAt?.toDate?.().toLocaleDateString("en-IN") ?? "-"}
+                            📅 Joined {formatTimestamp(c.createdAt || c.registeredAt)}
                           </div>
                           <div style={{ fontSize:12, fontWeight:700, color:"#FF6B35" }}>View Profile →</div>
                         </div>
@@ -843,18 +1069,17 @@ export default function AdminDashboard({ onLogout }) {
                   })}
               </div>
 
-              {/* Leaderboard */}
               {customers.length > 0 && (
                 <div style={{ background:"linear-gradient(135deg,#2C1A0E,#4a2c14)", borderRadius:20, padding:"28px 32px" }}>
                   <div style={{ fontFamily:"'Playfair Display',serif", fontSize:20,
                     fontWeight:700, color:"#F7C59F", marginBottom:20 }}>🏆 Top Spenders</div>
                   {[...customers]
-                    .map(c => ({ ...c, spent: orders.filter(o=>o.userId===c.userId).reduce((s,o)=>s+(o.totalAmount||0),0) }))
+                    .map(c => ({ ...c, spent: orders.filter(o=>o.userId===c.userId).reduce((s,o)=>s + getOrderAmount(o),0) }))
                     .sort((a,b) => b.spent - a.spent)
                     .slice(0,4)
                     .map((c,i) => {
                       const medals = ["🥇","🥈","🥉","4️⃣"];
-                      const maxSpent = Math.max(...customers.map(x => orders.filter(o=>o.userId===x.userId).reduce((s,o)=>s+(o.totalAmount||0),0)));
+                      const maxSpent = Math.max(...customers.map(x => orders.filter(o=>o.userId===x.userId).reduce((s,o)=>s + getOrderAmount(o),0)));
                       return (
                         <div key={c.userId} style={{ display:"flex", alignItems:"center", gap:14,
                           padding:"12px 16px", background:"rgba(255,255,255,0.06)", borderRadius:14, marginBottom:10 }}>
@@ -890,6 +1115,7 @@ export default function AdminDashboard({ onLogout }) {
         customer={selectedCustomer}
         onClose={() => setSelectedCustomer(null)}
         gradient={AVATAR_GRADIENTS[customers.findIndex(c=>c.userId===selectedCustomer?.userId)%4] || AVATAR_GRADIENTS[0]}
+        usersDataRef={usersDataRef}
       />
     </>
   );
